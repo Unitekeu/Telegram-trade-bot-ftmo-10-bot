@@ -1,0 +1,55 @@
+# Telegram Trading Bot (MT5)
+
+A real Telegram trading bot for MetaTrader5 with support for:
+- Gold (XAUUSD)
+- USD/JPY (USDJPY)
+- Bitcoin (BTCUSD)
+
+## Features
+- Connect to MT5
+- Show account status
+- Open BUY/SELL orders
+- Close all positions
+- List supported instruments
+- Support common aliases like GOLD, XAU, USDJPY, BTC, BTCUSD
+
+## Installation
+
+1. Install dependencies:
+```bash
+pip install -r requirements.txt
+```
+
+2. Copy `.env.example` to `.env` and fill in your credentials:
+```env
+TELEGRAM_BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN_HERE
+MT5_LOGIN=12345678
+MT5_PASSWORD=YOUR_MT5_PASSWORD
+MT5_SERVER=Broker-Server-Name
+DEFAULT_LOT=0.05
+RISK_PERCENT=1.0
+```
+
+3. Run the bot:
+```bash
+python bot.py
+```
+
+## Commands
+- `/start`
+- `/connect`
+- `/status`
+- `/buy GOLD 0.05`
+- `/sell USDJPY 0.10`
+- `/buy BTC 0.01`
+- `/closeall`
+- `/symbols`
+
+## Important notes
+- Use this on a demo account first.
+- MT5 names may vary slightly by broker.
+- This is a basic real trading bot starter, not an auto-profit system.
+- Always apply risk management and test carefully before live trading.
+
+## Disclaimer
+This project is for educational and testing purposes. Trading financial instruments carries risk. The author is not responsible for financial losses.
