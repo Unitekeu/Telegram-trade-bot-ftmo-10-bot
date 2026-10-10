@@ -1,34 +1,32 @@
 import logging
-from typing import Any, Dict
+from datetime import datetime
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 import MetaTrader5 as mt5
 
-from config import (
-    DEFAULT_LOT,
-    MAX_DAILY_DRAWDOWN_PERCENT,
-    MAX_OPEN_TRADES,
-    MAX_TOTAL_DRAWDOWN_PERCENT,
-    MIN_STOP_LOSS_POINTS,
-    MT5_LOGIN,
-    MT5_PASSWORD,
-    MT5_SERVER,
-    RISK_PERCENT,
-    TELEGRAM_BOT_TOKEN,
-)
-from strategy import generate_signal, supported_symbols
-from ftmo_controller import FTMORiskController
-from trade_logger import TradeLogger
+# =========================================
+# CONFIG
+# =========================================
+TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+MT5_LOGIN = 0
+MT5_PASSWORD = ""
+MT5_SERVER = "YOUR_SERVER"
+
+MAX_OPEN_TRADES = 3
+MAX_DAILY_DRAWDOWN_PERCENT = 5.0
+MAX_TOTAL_DRAWDOWN_PERCENT = 4.0
+MIN_STOP_LOSS_POINTS = 50
+RISK_PERCENT = 0.5
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 
-ftmo_controller = FTMORiskController(initial_balance=200000)
-trade_logger = TradeLogger()
-
+# =========================================
+# MT5 CLIENT
+# =========================================
 class MT5Client:
     def __init__(self, login, password, server):
         self.login = login
@@ -52,9 +50,9 @@ class MT5Client:
 
     def connect(self):
         if self.login == 0 or not self.password or not self.server:
-            raise RuntimeError("MT5 login/password/server missing. Check .env")
+            raise RuntimeError("MT5 login/password/server missing")
         if not mt5.initialize(login=self.login, password=self.password, server=self.server):
-            raise RuntimeError(f"MT5 initialization failed: {mt5.last_error()}")
+            raise RuntimeError(f"MT5 init failed: {mt5.last_error()}")
         self.connected = True
         return True
 
@@ -88,13 +86,13 @@ class MT5Client:
             "last": float(tick.last),
         }
 
-    def buy(self, symbol, volume, sl=None, tp=None, comment="AUTO BUY"):
+    def buy(self, symbol, volume, sl=None, tp=None, comment="BUY"):
         if not self.connected:
             raise RuntimeError("MT5 not connected")
         normalized = self.normalize_symbol(symbol)
         tick = mt5.symbol_info_tick(normalized)
         if tick is None:
-            raise RuntimeError(f"Symbol {normalized} not available in MT5")
+            raise RuntimeError(f"Symbol {normalized} not found")
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": normalized,
@@ -111,13 +109,13 @@ class MT5Client:
         }
         return mt5.order_send(request)
 
-    def sell(self, symbol, volume, sl=None, tp=None, comment="AUTO SELL"):
+    def sell(self, symbol, volume, sl=None, tp=None, comment="SELL"):
         if not self.connected:
             raise RuntimeError("MT5 not connected")
         normalized = self.normalize_symbol(symbol)
         tick = mt5.symbol_info_tick(normalized)
         if tick is None:
-            raise RuntimeError(f"Symbol {normalized} not available in MT5")
+            raise RuntimeError(f"Symbol {normalized} not found")
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": normalized,
@@ -180,223 +178,271 @@ class MT5Client:
 
 mt5_client = MT5Client(MT5_LOGIN, MT5_PASSWORD, MT5_SERVER)
 
+# =========================================
+# FTMO VALIDATION
+# =========================================
+def validate_trade_dimensions(account_info, positions_count, volume, sl_points, tp_points):
+    if not account_info:
+        return False, "Account info unavailable."
+    if positions_count >= MAX_OPEN_TRADES:
+        return False, f"Max open trades: {MAX_OPEN_TRADES}"
+    if volume <= 0:
+        return False, "Volume must be > 0"
+    if sl_points < MIN_STOP_LOSS_POINTS:
+        return False, f"SL too small. Min: {MIN_STOP_LOSS_POINTS} points"
+    if tp_points <= sl_points:
+        return False, "TP must be > SL"
 
-def build_signal_message(signal_info: Dict[str, Any]) -> str:
-    symbol = signal_info["symbol"]
-    side = signal_info["signal"]
-    price = signal_info["price"]
-    sl = signal_info["sl"]
-    tp = signal_info["tp"]
-    rsi = signal_info["rsi"]
-    ema_short = signal_info["ema_short"]
-    ema_long = signal_info["ema_long"]
-    ema_trend = signal_info["ema_trend"]
-    macd = signal_info.get("macd", 0)
-    atr = signal_info.get("atr", 0)
+    balance = account_info["balance"]
+    profit = account_info["profit"]
+    daily_limit = balance * (MAX_DAILY_DRAWDOWN_PERCENT / 100.0)
+    total_limit = balance * (MAX_TOTAL_DRAWDOWN_PERCENT / 100.0)
 
-    return (
-        f"📡 *AUTO SIGNAL*\n\n"
-        f"Symbol: {symbol}\n"
-        f"Direction: {side}\n"
-        f"Price: {price:.5f}\n"
-        f"SL: {sl:.5f}\n"
-        f"TP: {tp:.5f}\n"
-        f"RSI: {rsi:.2f}\n"
-        f"EMA20: {ema_short:.5f}\n"
-        f"EMA50: {ema_long:.5f}\n"
-        f"EMA200: {ema_trend:.5f}\n"
-        f"MACD: {macd:.5f}\n"
-        f"ATR: {atr:.5f}\n\n"
-        "Use the buttons below to confirm or reject this signal."
-    )
+    if profit <= -daily_limit:
+        return False, f"Daily limit reached: {MAX_DAILY_DRAWDOWN_PERCENT}%"
+    if profit <= -total_limit:
+        return False, f"Total limit reached: {MAX_TOTAL_DRAWDOWN_PERCENT}%"
+
+    return True, "OK"
 
 
+# =========================================
+# FIBO LOGIC
+# =========================================
+def fib_partial_levels(entry, direction):
+    """Calculate TP1, TP2, TP3, SL for Fibo strategy"""
+    if direction == "BUY":
+        return {
+            "TP1": entry + 0.022,
+            "TP2": entry + 0.044,
+            "TP3": entry + 0.099,
+            "SL": entry - 0.060,
+        }
+    else:  # SELL
+        return {
+            "TP1": entry - 0.022,
+            "TP2": entry - 0.044,
+            "TP3": entry - 0.099,
+            "SL": entry + 0.060,
+        }
+
+
+def partial_close_split(total_volume):
+    """Split volume: 33% / 33% / 34%"""
+    v1 = total_volume * 0.33
+    v2 = total_volume * 0.33
+    v3 = total_volume * 0.34
+    return round(v1, 3), round(v2, 3), round(v3, 3)
+
+
+# =========================================
+# TELEGRAM COMMANDS
+# =========================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "🔥 *FTMO PRO SIGNAL BOT*\n\n"
+    msg = (
+        "🔥 *FIBO FTMO BOT*\n\n"
+        "Commands:\n"
         "• /connect\n"
         "• /status\n"
-        "• /scan\n"
-        "• /manual BUY GOLD 0.02 60 120\n"
-        "• /manual SELL USDJPY 0.10 80 160\n"
+        "• /buyfibo GOLD 0.02\n"
+        "• /sellfibo USDJPY 0.10\n"
         "• /closeall\n\n"
-        "🛡️ FTMO protections:\n"
-        "• Max 3 positions\n"
-        f"• Risk per trade: {RISK_PERCENT}%\n"
-        f"• Min SL: {MIN_STOP_LOSS_POINTS} points\n"
-        f"• Max daily drawdown: {MAX_DAILY_DRAWDOWN_PERCENT}%\n"
-        f"• Max total drawdown: {MAX_TOTAL_DRAWDOWN_PERCENT}%"
+        "Fibo targets:\n"
+        "TP1 = +0.022\n"
+        "TP2 = +0.044\n"
+        "TP3 = +0.099\n"
+        "SL = -0.060\n\n"
+        "Volume split: 33% / 33% / 34%"
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def connect_mt5(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         mt5_client.connect()
-        await update.message.reply_text("✅ MT5 connection successful.")
+        await update.message.reply_text("✅ MT5 connected.")
     except Exception as e:
         await update.message.reply_text(f"❌ MT5 connection failed: {e}")
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not mt5_client.connected:
-        await update.message.reply_text("❌ MT5 is not connected. Use /connect first.")
+        await update.message.reply_text("❌ MT5 not connected. Use /connect first.")
         return
+
     info = mt5_client.account_info()
     if not info:
         await update.message.reply_text("❌ Could not read account info.")
         return
-    ftmo_text = ftmo_controller.format_status(info)
+
     positions = mt5_client.positions()
     pos_text = "No active positions."
     if positions:
         pos_text = "\n".join(
-            [f"- {p.symbol} | {p.type} | Vol: {p.volume} | P/L: ${p.profit:.2f}" for p in positions]
+            [f"• {p.symbol} | {p.type} | Vol: {p.volume} | P/L: ${p.profit:.2f}" for p in positions]
         )
-    text = f"{ftmo_text}\n\n📊 Active positions:\n{pos_text}"
-    await update.message.reply_text(text, parse_mode="Markdown")
+
+    balance = info["balance"]
+    profit = info["profit"]
+    daily_pct = (abs(profit) / balance * 100) if profit < 0 else 0
+    total_pct = (abs(profit) / balance * 100) if profit < 0 else 0
+
+    status_icon = "🟢" if daily_pct < 80 else "🟡" if daily_pct < 100 else "🔴"
+
+    msg = (
+        f"{status_icon} *ACCOUNT STATUS*\n\n"
+        f"Balance: ${balance:.2f}\n"
+        f"Equity: ${info['equity']:.2f}\n"
+        f"Profit: ${profit:.2f}\n"
+        f"Margin: ${info['margin']:.2f}\n"
+        f"Free Margin: ${info['free_margin']:.2f}\n\n"
+        f"Daily DD: {daily_pct:.1f}% / {MAX_DAILY_DRAWDOWN_PERCENT}%\n"
+        f"Total DD: {total_pct:.1f}% / {MAX_TOTAL_DRAWDOWN_PERCENT}%\n\n"
+        f"Positions:\n{pos_text}"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
-async def manual_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def buy_fibo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not mt5_client.connected:
         await update.message.reply_text("❌ MT5 not connected. Use /connect first.")
         return
-    if len(context.args) < 5:
-        await update.message.reply_text("Use: /manual BUY GOLD 0.02 60 120\nOr\n/manual SELL USDJPY 0.10 80 160")
+
+    if len(context.args) < 2:
+        await update.message.reply_text("Use: /buyfibo GOLD 0.02")
         return
-    side = context.args[0].upper()
-    symbol = context.args[1].upper()
-    volume = float(context.args[2])
-    sl_points = int(context.args[3])
-    tp_points = int(context.args[4])
+
+    symbol = context.args[0].upper()
+    try:
+        volume = float(context.args[1])
+    except ValueError:
+        await update.message.reply_text("Invalid volume.")
+        return
+
     normalized = mt5_client.normalize_symbol(symbol)
     market = mt5_client.market_price(normalized)
     if not market:
-        await update.message.reply_text(f"❌ {normalized} is not available in MT5.")
+        await update.message.reply_text(f"❌ {normalized} not available in MT5.")
         return
-    info = mt5_client.account_info()
-    ok, msg = ftmo_controller.validate_trade(info, len(mt5_client.positions()), volume, sl_points, tp_points)
+
+    account = mt5_client.account_info()
+    ok, message = validate_trade_dimensions(account, len(mt5_client.positions()), volume, 60, 120)
     if not ok:
-        await update.message.reply_text(f"❌ {msg}")
+        await update.message.reply_text(f"❌ {message}")
         return
-    if side == "BUY":
-        sl_value = market["ask"] - (sl_points * 0.0001)
-        tp_value = market["ask"] + (tp_points * 0.0001)
-        result = mt5_client.buy(normalized, volume, sl=sl_value, tp=tp_value, comment="MANUAL BUY")
-    elif side == "SELL":
-        sl_value = market["bid"] + (sl_points * 0.0001)
-        tp_value = market["bid"] - (tp_points * 0.0001)
-        result = mt5_client.sell(normalized, volume, sl=sl_value, tp=tp_value, comment="MANUAL SELL")
-    else:
-        await update.message.reply_text("Use BUY or SELL.")
-        return
-    if result is None or result.retcode not in (0, 10009, 10008):
-        await update.message.reply_text(f"❌ Order failed: {result.comment if result else 'Unknown error'}")
-        return
-    trade_logger.log_trade({
-        "event": "manual_trade",
-        "symbol": normalized,
-        "direction": side,
-        "volume": volume,
-        "sl": sl_value,
-        "tp": tp_value,
-    })
-    await update.message.reply_text(f"✅ Manual {side} order executed for {normalized}.")
+
+    entry = market["ask"]
+    levels = fib_partial_levels(entry, "BUY")
+    v1, v2, v3 = partial_close_split(volume)
+
+    try:
+        result = mt5_client.buy(normalized, volume, sl=levels["SL"], tp=levels["TP1"], comment="FIBO BUY MAIN")
+        if result is None or result.retcode not in (0, 10009, 10008):
+            await update.message.reply_text(f"❌ Main order failed: {result.comment if result else 'Unknown'}")
+            return
+
+        # Partial closes
+        mt5_client.sell(normalized, v1, tp=levels["TP1"], comment="FIBO TP1")
+        mt5_client.sell(normalized, v2, tp=levels["TP2"], comment="FIBO TP2")
+        mt5_client.sell(normalized, v3, tp=levels["TP3"], comment="FIBO TP3")
+
+        text = (
+            f"✅ *BUY FIBO* opened for {normalized}\n\n"
+            f"Entry: {entry:.5f}\n"
+            f"TP1: {levels['TP1']:.5f} | Vol: {v1}\n"
+            f"TP2: {levels['TP2']:.5f} | Vol: {v2}\n"
+            f"TP3: {levels['TP3']:.5f} | Vol: {v3}\n"
+            f"SL: {levels['SL']:.5f}\n\n"
+            f"Total Vol: {volume}"
+        )
+        await update.message.reply_text(text, parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
 
 
-async def scan_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def sell_fibo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not mt5_client.connected:
         await update.message.reply_text("❌ MT5 not connected. Use /connect first.")
         return
-    found_signal = False
-    for symbol in supported_symbols():
-        signal = generate_signal(symbol)
-        if signal is None:
-            continue
-        trade_logger.log_signal({"symbol": signal["symbol"], "signal": signal["signal"], "price": signal["price"], "rsi": signal["rsi"], "ema_short": signal["ema_short"], "ema_long": signal["ema_long"], "ema_trend": signal["ema_trend"]})
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("✅ Confirm", callback_data=f"confirm|{signal['symbol']}|{signal['signal']}|{signal['volume']}|{signal['sl_points']}|{signal['tp_points']}"),
-                InlineKeyboardButton("❌ Reject", callback_data=f"reject|{signal['symbol']}|{signal['signal']}"),
-            ]
-        ])
-        await update.message.reply_text(build_signal_message(signal), parse_mode="Markdown", reply_markup=keyboard)
-        found_signal = True
-    if not found_signal:
-        await update.message.reply_text("📡 No valid signal found right now.")
 
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data or ""
-    parts = data.split("|")
-    action = parts[0]
-    if action == "reject":
-        await query.edit_message_text("❌ Signal rejected.")
+    if len(context.args) < 2:
+        await update.message.reply_text("Use: /sellfibo USDJPY 0.10")
         return
-    if action == "confirm":
-        if len(parts) < 6:
-            await query.edit_message_text("❌ Invalid signal payload.")
-            return
-        symbol = parts[1]
-        side = parts[2]
-        volume = float(parts[3])
-        sl_points = int(parts[4])
-        tp_points = int(parts[5])
-        market = mt5_client.market_price(symbol)
-        if not market:
-            await query.edit_message_text(f"❌ {symbol} not available in MT5.")
-            return
-        info = mt5_client.account_info()
-        ok, msg = ftmo_controller.validate_trade(info, len(mt5_client.positions()), volume, sl_points, tp_points)
-        if not ok:
-            await query.edit_message_text(f"❌ {msg}")
-            return
-        if side == "BUY":
-            sl_value = market["ask"] - (sl_points * 0.0001)
-            tp_value = market["ask"] + (tp_points * 0.0001)
-            result = mt5_client.buy(symbol, volume, sl=sl_value, tp=tp_value, comment="AUTO CONFIRMED BUY")
-            final_text = f"✅ Auto BUY executed for {symbol}."
-        else:
-            sl_value = market["bid"] + (sl_points * 0.0001)
-            tp_value = market["bid"] - (tp_points * 0.0001)
-            result = mt5_client.sell(symbol, volume, sl=sl_value, tp=tp_value, comment="AUTO CONFIRMED SELL")
-            final_text = f"✅ Auto SELL executed for {symbol}."
+
+    symbol = context.args[0].upper()
+    try:
+        volume = float(context.args[1])
+    except ValueError:
+        await update.message.reply_text("Invalid volume.")
+        return
+
+    normalized = mt5_client.normalize_symbol(symbol)
+    market = mt5_client.market_price(normalized)
+    if not market:
+        await update.message.reply_text(f"❌ {normalized} not available in MT5.")
+        return
+
+    account = mt5_client.account_info()
+    ok, message = validate_trade_dimensions(account, len(mt5_client.positions()), volume, 60, 120)
+    if not ok:
+        await update.message.reply_text(f"❌ {message}")
+        return
+
+    entry = market["bid"]
+    levels = fib_partial_levels(entry, "SELL")
+    v1, v2, v3 = partial_close_split(volume)
+
+    try:
+        result = mt5_client.sell(normalized, volume, sl=levels["SL"], tp=levels["TP1"], comment="FIBO SELL MAIN")
         if result is None or result.retcode not in (0, 10009, 10008):
-            await query.edit_message_text(f"❌ Trade failed: {result.comment if result else 'Unknown error'}")
+            await update.message.reply_text(f"❌ Main order failed: {result.comment if result else 'Unknown'}")
             return
-        trade_logger.log_trade({
-            "event": "auto_confirmed_trade",
-            "symbol": symbol,
-            "direction": side,
-            "volume": volume,
-            "sl": sl_value,
-            "tp": tp_value,
-        })
-        await query.edit_message_text(final_text)
+
+        # Partial closes
+        mt5_client.buy(normalized, v1, tp=levels["TP1"], comment="FIBO TP1")
+        mt5_client.buy(normalized, v2, tp=levels["TP2"], comment="FIBO TP2")
+        mt5_client.buy(normalized, v3, tp=levels["TP3"], comment="FIBO TP3")
+
+        text = (
+            f"✅ *SELL FIBO* opened for {normalized}\n\n"
+            f"Entry: {entry:.5f}\n"
+            f"TP1: {levels['TP1']:.5f} | Vol: {v1}\n"
+            f"TP2: {levels['TP2']:.5f} | Vol: {v2}\n"
+            f"TP3: {levels['TP3']:.5f} | Vol: {v3}\n"
+            f"SL: {levels['SL']:.5f}\n\n"
+            f"Total Vol: {volume}"
+        )
+        await update.message.reply_text(text, parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
 
 
 async def close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not mt5_client.connected:
-        await update.message.reply_text("❌ MT5 not connected. Use /connect first.")
+        await update.message.reply_text("❌ MT5 not connected.")
         return
-    mt5_client.close_all_positions()
-    await update.message.reply_text("✅ All positions closed.")
+    
+    closed = mt5_client.close_all_positions()
+    if not closed:
+        await update.message.reply_text("✅ No positions to close.")
+        return
+    
+    await update.message.reply_text(f"✅ {len(closed)} position(s) closed.")
 
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN missing. Add it in .env")
+        raise RuntimeError("TELEGRAM_BOT_TOKEN missing. Add it in config.")
+
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("connect", connect_mt5))
     app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("scan", scan_signals))
-    app.add_handler(CommandHandler("manual", manual_trade))
+    app.add_handler(CommandHandler("buyfibo", buy_fibo))
+    app.add_handler(CommandHandler("sellfibo", sell_fibo))
     app.add_handler(CommandHandler("closeall", close_all))
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    print("FTMO Pro Signal Bot started...")
+
+    print("🚀 FIBO FTMO BOT started...")
     app.run_polling()
 
 
