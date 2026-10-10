@@ -1,4 +1,4 @@
-# Telegram Trading Bot
+# FTMO-safe Telegram Trading Bot
 # Supported instruments: GOLD, USDJPY, BTCUSD
 
 import logging
@@ -6,7 +6,18 @@ import logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-from config import DEFAULT_LOT, MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, TELEGRAM_BOT_TOKEN
+from config import (
+    DEFAULT_LOT,
+    MAX_DAILY_DRAWDOWN_PERCENT,
+    MAX_OPEN_TRADES,
+    MAX_TOTAL_DRAWDOWN_PERCENT,
+    MIN_STOP_LOSS_POINTS,
+    MT5_LOGIN,
+    MT5_PASSWORD,
+    MT5_SERVER,
+    RISK_PERCENT,
+    TELEGRAM_BOT_TOKEN,
+)
 from mt5_client import MT5Client
 
 logging.basicConfig(
@@ -18,16 +29,50 @@ mt5_client = MT5Client(MT5_LOGIN, MT5_PASSWORD, MT5_SERVER)
 
 
 def format_position_type(position_type):
-    values = {
-        0: "BUY",
-        1: "SELL",
-    }
+    values = {0: "BUY", 1: "SELL"}
     return values.get(position_type, str(position_type))
+
+
+def ftmo_trade_guard(account_info, positions, symbol, volume, sl_points, tp_points):
+    if not account_info:
+        return "MT5 account info not available."
+
+    if len(positions or []) >= MAX_OPEN_TRADES:
+        return f"Max open trades reached: {MAX_OPEN_TRADES}. Close one before opening a new trade."
+
+    if sl_points < MIN_STOP_LOSS_POINTS:
+        return f"Stop loss too small. Minimum allowed is {MIN_STOP_LOSS_POINTS} points."
+
+    if tp_points <= sl_points:
+        return "Take profit must be greater than stop loss."
+
+    balance = account_info["balance"]
+    if balance <= 0:
+        return "Invalid account balance."
+
+    risk_amount = balance * (RISK_PERCENT / 100.0)
+    if volume * 1000 <= 0:
+        return "Volume must be greater than zero."
+
+    if account_info["equity"] <= 0:
+        return "Account equity invalid."
+
+    if MAX_DAILY_DRAWDOWN_PERCENT > 0:
+        daily_loss_limit = balance * (MAX_DAILY_DRAWDOWN_PERCENT / 100.0)
+        if account_info["profit"] <= -daily_loss_limit:
+            return f"Daily loss limit reached. Max allowed daily drawdown: {MAX_DAILY_DRAWDOWN_PERCENT}%"
+
+    if MAX_TOTAL_DRAWDOWN_PERCENT > 0:
+        total_loss_limit = balance * (MAX_TOTAL_DRAWDOWN_PERCENT / 100.0)
+        if account_info["profit"] <= -total_loss_limit:
+            return f"Total loss limit reached. Max allowed total drawdown: {MAX_TOTAL_DRAWDOWN_PERCENT}%"
+
+    return None
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "🔥 *MT5 Trading Bot*\n\n"
+        "🔥 *FTMO SAFE MT5 BOT*\n\n"
         "Instrumentet e mbështetura:\n"
         "• GOLD / XAUUSD\n"
         "• USD/JPY / USDJPY\n"
@@ -35,11 +80,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Komandat:\n"
         "/connect\n"
         "/status\n"
-        "/buy GOLD 0.05\n"
-        "/sell USDJPY 0.10\n"
-        "/buy BTC 0.01\n"
+        "/buy GOLD 0.02 60 120\n"
+        "/sell USDJPY 0.10 80 160\n"
         "/closeall\n"
-        "/symbols"
+        "/symbols\n\n"
+        "Rregulla for FTMO:\n"
+        "• Max 3 open trades\n"
+        f"• Max risk per trade: {RISK_PERCENT}%\n"
+        f"• Min SL: {MIN_STOP_LOSS_POINTS} points\n"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -90,16 +138,33 @@ async def buy_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ MT5 nuk është lidhur. Shtyp /connect")
         return
 
-    if len(context.args) < 2:
-        await update.message.reply_text("Përdorim: /buy GOLD 0.05 ose /buy BTC 0.01")
+    if len(context.args) < 4:
+        await update.message.reply_text("Përdorim: /buy GOLD 0.02 60 120")
         return
 
     symbol = context.args[0]
     volume = float(context.args[1])
+    sl_points = int(context.args[2])
+    tp_points = int(context.args[3])
     normalized = mt5_client.normalize_symbol(symbol)
 
+    info = mt5_client.account_info()
+    positions = mt5_client.positions()
+    guard_error = ftmo_trade_guard(info, positions, normalized, volume, sl_points, tp_points)
+    if guard_error:
+        await update.message.reply_text(f"❌ {guard_error}")
+        return
+
     try:
-        result = mt5_client.buy(normalized, volume, comment="TG BUY")
+        market = mt5_client.market_price(normalized)
+        if not market:
+            await update.message.reply_text(f"❌ Symboli {normalized} nuk është i disponueshëm.")
+            return
+
+        sl_value = market["ask"] - (sl_points * 0.01)
+        tp_value = market["ask"] + (tp_points * 0.01)
+        result = mt5_client.buy(normalized, volume, sl=sl_value, tp=tp_value, comment="TG BUY")
+
         if result is None:
             await update.message.reply_text(f"❌ Porosia për {normalized} dështoi.")
             return
@@ -108,9 +173,8 @@ async def buy_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Gabim: {result.comment}")
             return
 
-        price = mt5_client.market_price(normalized)
         await update.message.reply_text(
-            f"✅ Buy u hap për {normalized}\nVolume: {volume}\nAsk: {price['ask'] if price else 'N/A'}"
+            f"✅ Buy u hap për {normalized}\nVolume: {volume}\nSL: {sl_value}\nTP: {tp_value}"
         )
     except Exception as e:
         await update.message.reply_text(f"❌ Gabim: {e}")
@@ -121,16 +185,33 @@ async def sell_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ MT5 nuk është lidhur. Shtyp /connect")
         return
 
-    if len(context.args) < 2:
-        await update.message.reply_text("Përdorim: /sell GOLD 0.05 ose /sell USDJPY 0.10")
+    if len(context.args) < 4:
+        await update.message.reply_text("Përdorim: /sell USDJPY 0.10 80 160")
         return
 
     symbol = context.args[0]
     volume = float(context.args[1])
+    sl_points = int(context.args[2])
+    tp_points = int(context.args[3])
     normalized = mt5_client.normalize_symbol(symbol)
 
+    info = mt5_client.account_info()
+    positions = mt5_client.positions()
+    guard_error = ftmo_trade_guard(info, positions, normalized, volume, sl_points, tp_points)
+    if guard_error:
+        await update.message.reply_text(f"❌ {guard_error}")
+        return
+
     try:
-        result = mt5_client.sell(normalized, volume, comment="TG SELL")
+        market = mt5_client.market_price(normalized)
+        if not market:
+            await update.message.reply_text(f"❌ Symboli {normalized} nuk është i disponueshëm.")
+            return
+
+        sl_value = market["bid"] + (sl_points * 0.01)
+        tp_value = market["bid"] - (tp_points * 0.01)
+        result = mt5_client.sell(normalized, volume, sl=sl_value, tp=tp_value, comment="TG SELL")
+
         if result is None:
             await update.message.reply_text(f"❌ Porosia për {normalized} dështoi.")
             return
@@ -139,9 +220,8 @@ async def sell_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Gabim: {result.comment}")
             return
 
-        price = mt5_client.market_price(normalized)
         await update.message.reply_text(
-            f"✅ Sell u hap për {normalized}\nVolume: {volume}\nBid: {price['bid'] if price else 'N/A'}"
+            f"✅ Sell u hap për {normalized}\nVolume: {volume}\nSL: {sl_value}\nTP: {tp_value}"
         )
     except Exception as e:
         await update.message.reply_text(f"❌ Gabim: {e}")
@@ -182,7 +262,7 @@ def main():
     app.add_handler(CommandHandler("closeall", close_all))
     app.add_handler(CommandHandler("symbols", symbols))
 
-    print("Bot started...")
+    print("FTMO-safe trading bot started...")
     app.run_polling()
 
 
