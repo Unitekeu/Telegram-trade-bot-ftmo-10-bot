@@ -1,18 +1,27 @@
 # FTMO Pro Bot 🚀
 
-Telegram bot for automated trading on **MetaTrader 5 (MT5)** with **FTMO-compliant** risk management.
+![FTMO Pro Bot](https://github.com/Unitekeu/Telegram-trade-bot-ftmo-10-bot/raw/main/screenshot.png)
 
-It generates trading signals, sends confirmation buttons on Telegram, and executes trades on MT5 while enforcing strict risk rules.
+**Telegram + MetaTrader 5** automated trading bot built for **FTMO** challenges and funded accounts.
+
+It generates smart signals, sends confirmation buttons on Telegram, executes trades on MT5, and strictly follows FTMO risk rules.
+
+## Languages / Gjuhët
+
+- [English](README.md)
+- [Shqip](README.sq.md)
+- Français, Italiano, Ελληνικά, Deutsch, Español — coming soon
 
 ## Features
 
-- Auto signal generation and execution
-- Telegram confirmation buttons before trade
-- FTMO-safe risk controls
-- MT5 integration (Gold, USDJPY, BTCUSD)
-- Trade & signal logging
-- Manual trade commands
-- Status and scan commands
+| Feature                    | Description                                      |
+|----------------------------|--------------------------------------------------|
+| Telegram Control           | Full control, alerts, and confirmation buttons   |
+| MT5 Automated Trading      | Direct connection to MetaTrader 5                |
+| FTMO Risk Rules Engine     | Built-in daily/total drawdown and position limits|
+| Challenge & Funded Safe    | Designed to pass FTMO rules                      |
+| Real-time Notifications    | Instant alerts for entries, exits, and risks     |
+| Easy Setup                 | Simple `.env` configuration                      |
 
 ## Supported Symbols
 
@@ -22,7 +31,7 @@ It generates trading signals, sends confirmation buttons on Telegram, and execut
 
 ## Strategy
 
-Signals are generated on the **M15** timeframe using:
+Signals generated on **M15** timeframe using:
 
 - EMA 20 / 50 / 200
 - RSI (14)
@@ -41,28 +50,23 @@ Signals are generated on the **M15** timeframe using:
 
 ## Setup
 
-1. **Clone the repository**
+1. Clone the repository
    ```bash
    git clone https://github.com/Unitekeu/Telegram-trade-bot-ftmo-10-bot.git
    cd Telegram-trade-bot-ftmo-10-bot
    ```
 
-2. **Install dependencies**
+2. Install dependencies
    ```bash
    pip install -r requirements.txt
    ```
 
-3. **Create environment file**
+3. Create and edit `.env`
    ```bash
    cp .env.example .env
    ```
-   Then edit `.env` and fill in:
-   - `TELEGRAM_BOT_TOKEN`
-   - `MT5_LOGIN`
-   - `MT5_PASSWORD`
-   - `MT5_SERVER`
 
-4. **Run the bot**
+4. Run
    ```bash
    python telegram_bot.py
    ```
@@ -73,23 +77,18 @@ Signals are generated on the **M15** timeframe using:
 |--------------------------------------|--------------------------------------|
 | `/start`                             | Start the bot                        |
 | `/connect`                           | Connect to MT5                       |
-| `/status`                            | Show current status & open trades    |
+| `/status`                            | Show status and open trades          |
 | `/scan`                              | Scan for new signals                 |
-| `/manual BUY GOLD 0.02 60 120`       | Manual buy trade                     |
-| `/manual SELL USDJPY 0.10 80 160`    | Manual sell trade                    |
-| `/closeall`                          | Close all open positions             |
+| `/manual BUY GOLD 0.02 60 120`       | Manual buy                           |
+| `/manual SELL USDJPY 0.10 80 160`    | Manual sell                          |
+| `/closeall`                          | Close all positions                  |
 
-## Important Warning
+## Warning
 
-> **Use on demo account first.**  
-> This bot is for educational purposes. Trading involves risk. Past performance does not guarantee future results. The developer is not responsible for any financial losses.
+> Use on **demo first**. Trading involves risk of loss. This is not financial advice.
 
 ## Requirements
 
 - Python 3.10+
-- MetaTrader 5 terminal installed and logged in
+- MetaTrader 5
 - Telegram Bot Token
-
-## License
-
-MIT (add a license file if needed)
