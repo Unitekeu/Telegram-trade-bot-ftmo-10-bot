@@ -9,8 +9,12 @@ It generates smart signals, sends confirmation buttons on Telegram, executes tra
 ## Languages / Gjuhët
 
 - [English](README.md)
+- [Français](README.fr.md)
 - [Shqip](README.sq.md)
-- Français, Italiano, Ελληνικά, Deutsch, Español — coming soon
+- [Italiano](README.it.md)
+- [Ελληνικά](README.el.md)
+- [Deutsch](README.de.md)
+- [Español](README.es.md)
 
 ## Features
 
