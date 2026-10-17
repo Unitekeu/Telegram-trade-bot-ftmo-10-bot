@@ -12,6 +12,8 @@ It generates smart signals, sends confirmation buttons on Telegram, executes tra
 - App / Telegram icon: `logo_icon.jpg`
 - Banner with Telegram: `logo_telegram.jpg`
 
+*(Logos are prepared and can be uploaded with the script below)*
+
 ## Languages / Gjuhët
 
 - [English](README.md)
