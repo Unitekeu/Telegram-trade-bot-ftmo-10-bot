@@ -1,10 +1,16 @@
 # FTMO Pro Bot 🚀
 
-![FTMO Pro Bot](https://github.com/Unitekeu/Telegram-trade-bot-ftmo-10-bot/raw/main/screenshot.png)
+![BFXTR Logo](https://github.com/Unitekeu/Telegram-trade-bot-ftmo-10-bot/raw/main/logo_main.jpg)
 
-**Telegram + MetaTrader 5** automated trading bot built for **FTMO** challenges and funded accounts.
+**Telegram + MetaTrader 5** automated trading bot built for **FTMO** challenges and funded accounts. Branding: **@bfxtr**
 
 It generates smart signals, sends confirmation buttons on Telegram, executes trades on MT5, and strictly follows FTMO risk rules.
+
+## Logos
+
+- Main logo: `logo_main.jpg`
+- App / Telegram icon: `logo_icon.jpg`
+- Banner with Telegram: `logo_telegram.jpg`
 
 ## Languages / Gjuhët
 
