@@ -1,106 +1,64 @@
-# FTMO Pro Bot 🚀
+# Universal MT5 Signal Bot
 
-![BFXTR Logo](https://github.com/Unitekeu/Telegram-trade-bot-ftmo-10-bot/raw/main/logo_main.jpg)
+Telegram + MetaTrader 5 signal and execution bot. It scans **visible, tradable instruments in MT5 Market Watch**, using broker-provided symbol specifications rather than hard-coded pip/point assumptions.
 
-**Telegram + MetaTrader 5** automated trading bot built for **FTMO** challenges and funded accounts. Branding: **@bfxtr**
+> **Risk warning:** this software is not guaranteed profitable and is not certified to comply with FTMO or another prop firm's rules. Test on a demo account and validate every instrument, order size, spread, stop level, swap, commission and execution mode before considering live use.
 
-It generates smart signals, sends confirmation buttons on Telegram, executes trades on MT5, and strictly follows FTMO risk rules.
+## Instrument coverage
 
-## Logos
-
-- Main logo: `logo_main.jpg`
-- App / Telegram icon: `logo_icon.jpg`
-- Banner with Telegram: `logo_telegram.jpg`
-
-*(Logos are prepared and can be uploaded with the script below)*
-
-## Languages / Gjuhët
-
-- [English](README.md)
-- [Français](README.fr.md)
-- [Shqip](README.sq.md)
-- [Italiano](README.it.md)
-- [Ελληνικά](README.el.md)
-- [Deutsch](README.de.md)
-- [Español](README.es.md)
-
-## Features
-
-| Feature                    | Description                                      |
-|----------------------------|--------------------------------------------------|
-| Telegram Control           | Full control, alerts, and confirmation buttons   |
-| MT5 Automated Trading      | Direct connection to MetaTrader 5                |
-| FTMO Risk Rules Engine     | Built-in daily/total drawdown and position limits|
-| Challenge & Funded Safe    | Designed to pass FTMO rules                      |
-| Real-time Notifications    | Instant alerts for entries, exits, and risks     |
-| Easy Setup                 | Simple `.env` configuration                      |
-
-## Supported Symbols
-
-- **XAUUSD** (Gold)
-- **USDJPY**
-- **BTCUSD**
+The bot can scan any instrument exposed as visible and tradable by the connected MT5 broker, including (if your broker provides them) forex pairs, metals, indices, energies, shares, ETFs, futures, CFDs and cryptocurrencies. Availability, trading hours and symbol names depend on the broker. Enable the desired instruments in MT5 Market Watch first. Some instruments may not have enough history or may not support the same order features.
 
 ## Strategy
 
-Signals generated on **M15** timeframe using:
+- Configurable timeframe (default M15).
+- EMA 20/50/200 trend alignment, Wilder RSI(14), correctly constructed MACD(12,26,9).
+- ATR-based stop distance and configurable reward/risk ratio.
+- Uses the last **closed** candle, not the live forming candle.
+- SL/TP are price distances derived from each instrument's ATR, not a universal fixed number of points.
+- Position size is calculated using MT5's `order_calc_profit` and the broker's volume minimum/maximum/step, aiming to keep estimated SL loss within the configured equity risk.
 
-- EMA 20 / 50 / 200
-- RSI (14)
-- MACD (12, 26, 9)
-- ATR (14)
+These are baseline rules, not proof of an edge. The same parameters will not perform equally across every asset class; build and validate separate backtests by instrument and timeframe.
 
-## Risk Management (FTMO Rules)
+## Safety controls
 
-| Rule                      | Value          |
-|---------------------------|----------------|
-| Max open trades           | 3              |
-| Risk per trade            | 0.5%           |
-| Minimum Stop Loss         | 50 points      |
-| Max daily drawdown        | 5%             |
-| Max total drawdown        | 4%             |
+- Only positions tagged with this bot's magic number are counted/targeted by the bot's close command.
+- Trade size is blocked if the broker minimum lot would exceed the configured risk budget.
+- The bot blocks orders if it cannot calculate risk, cannot obtain a quote, sees invalid SL/TP geometry, or sees excessive spread relative to the stop.
+- Restrict Telegram commands with `TELEGRAM_ALLOWED_USER_IDS`.
+- This version does **not** yet implement a persistent, rule-accurate daily/overall drawdown engine. Do not use it on a prop challenge or funded account until those limits are implemented and tested against the firm's current rules.
 
 ## Setup
 
-1. Clone the repository
-   ```bash
-   git clone https://github.com/Unitekeu/Telegram-trade-bot-ftmo-10-bot.git
-   cd Telegram-trade-bot-ftmo-10-bot
-   ```
-
-2. Install dependencies
+1. Install Python 3.10+, MetaTrader 5 terminal, and the packages:
    ```bash
    pip install -r requirements.txt
    ```
-
-3. Create and edit `.env`
+2. Copy `.env.example` to `.env` and fill in your own credentials and numeric Telegram user ID.
+3. Keep `.env` private; never commit credentials or bot tokens.
+4. Open MT5, sign in to the intended demo account, enable instruments in Market Watch, and ensure the terminal can trade.
+5. Start the modular bot:
    ```bash
-   cp .env.example .env
+   python bot.py
    ```
+6. In Telegram, run `/connect`, then `/status` and `/scan`.
 
-4. Run
-   ```bash
-   python telegram_bot.py
-   ```
+## Commands
 
-## Telegram Commands
+- `/start` — show commands.
+- `/connect` — connect to MT5.
+- `/status` — account status and positions opened by this bot.
+- `/scan` — scan visible tradable Market Watch symbols.
+- `/manual BUY SYMBOL VOLUME SL_PRICE TP_PRICE` — place a manual order using explicit prices, subject to the configured risk cap.
+- `/closeall` — request closure of positions carrying the bot's magic number only.
 
-| Command                              | Description                          |
-|--------------------------------------|--------------------------------------|
-| `/start`                             | Start the bot                        |
-| `/connect`                           | Connect to MT5                       |
-| `/status`                            | Show status and open trades          |
-| `/scan`                              | Scan for new signals                 |
-| `/manual BUY GOLD 0.02 60 120`       | Manual buy                           |
-| `/manual SELL USDJPY 0.10 80 160`    | Manual sell                          |
-| `/closeall`                          | Close all positions                  |
+Example manual command (replace with the exact symbol and prices for your broker):
+```
+/manual BUY EURUSD 0.01 1.08000 1.08400
+```
 
-## Warning
+## Important limitations
 
-> Use on **demo first**. Trading involves risk of loss. This is not financial advice.
-
-## Requirements
-
-- Python 3.10+
-- MetaTrader 5
-- Telegram Bot Token
+- Broker-specific execution modes, market sessions, margin rules and contract specifications differ. Validate on demo for each asset class.
+- The risk estimate does not fully account for gaps, slippage, spread changes, commissions or execution failures.
+- This version does not yet implement a persistent daily/maximum drawdown lock, trailing stop, economic calendar/news filter, portfolio correlation cap, or backtesting harness.
+- `telegram_bot.py` is a legacy entry point; use `bot.py` for the modular implementation.
