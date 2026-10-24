@@ -1,56 +1,32 @@
 import logging
-from typing import Dict, Any
+import math
+from typing import Any, Dict, Optional
 
+import MetaTrader5 as mt5
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
-import MetaTrader5 as mt5
 
 from config import (
-    DEFAULT_LOT,
-    MAX_OPEN_TRADES,
-    MAX_DAILY_DRAWDOWN_PERCENT,
-    MAX_TOTAL_DRAWDOWN_PERCENT,
-    MIN_STOP_LOSS_POINTS,
-    MT5_LOGIN,
-    MT5_PASSWORD,
-    MT5_SERVER,
-    RISK_PERCENT,
+    MAX_OPEN_TRADES, MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, RISK_PERCENT,
     TELEGRAM_BOT_TOKEN,
 )
 from strategy import generate_signal, supported_symbols
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-
-pending_signals: Dict[int, Dict[str, Any]] = {}
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
+MAGIC = 123456
+MAX_SPREAD_ATR_RATIO = 0.15
 
 
 class MT5Client:
     def __init__(self, login, password, server):
-        self.login = login
-        self.password = password
-        self.server = server
+        self.login, self.password, self.server = login, password, server
         self.connected = False
 
-    def normalize_symbol(self, symbol: str):
-        s = (symbol or "").strip().upper().replace(" ", "")
-        aliases = {
-            "GOLD": "XAUUSD",
-            "XAU": "XAUUSD",
-            "XAUUSD": "XAUUSD",
-            "USDJPY": "USDJPY",
-            "USD/JPY": "USDJPY",
-            "BTC": "BTCUSD",
-            "BTCUSD": "BTCUSD",
-            "BTC/USD": "BTCUSD",
-            "BITCOIN": "BTCUSD",
-        }
-        return aliases.get(s, s)
+    def normalize_symbol(self, symbol: str) -> str:
+        return (symbol or "").strip()
 
     def connect(self):
-        if self.login == 0 or not self.password or not self.server:
+        if not self.login or not self.password or not self.server:
             raise RuntimeError("MT5 login/password/server missing. Check .env")
         if not mt5.initialize(login=self.login, password=self.password, server=self.server):
             raise RuntimeError(f"MT5 initialization failed: {mt5.last_error()}")
@@ -58,352 +34,311 @@ class MT5Client:
         return True
 
     def account_info(self):
-        if not self.connected:
-            return None
-        info = mt5.account_info()
+        info = mt5.account_info() if self.connected else None
         if info is None:
             return None
-        return {
-            "login": info.login,
-            "balance": float(info.balance),
-            "equity": float(info.equity),
-            "margin": float(info.margin),
-            "free_margin": float(info.margin_free),
-            "profit": float(info.profit),
-            "currency": info.currency,
-        }
-
-    def get_symbol_info(self, symbol):
-        if not self.connected:
-            return None
-        return mt5.symbol_info(symbol)
+        return {"login": info.login, "balance": float(info.balance), "equity": float(info.equity),
+                "margin": float(info.margin), "free_margin": float(info.margin_free),
+                "profit": float(info.profit), "currency": info.currency}
 
     def market_price(self, symbol):
-        if not self.connected:
+        if not self.connected or not mt5.symbol_select(symbol, True):
             return None
-        normalized = self.normalize_symbol(symbol)
-        tick = mt5.symbol_info_tick(normalized)
-        if tick is None:
+        tick = mt5.symbol_info_tick(symbol)
+        info = mt5.symbol_info(symbol)
+        if tick is None or info is None or info.point <= 0:
             return None
-        return {
-            "symbol": normalized,
-            "ask": float(tick.ask),
-            "bid": float(tick.bid),
-            "last": float(tick.last),
-        }
-
-    def buy(self, symbol, volume, sl=None, tp=None, comment="AUTO BUY"):
-        if not self.connected:
-            raise RuntimeError("MT5 not connected")
-        normalized = self.normalize_symbol(symbol)
-        if self.get_symbol_info(normalized) is None:
-            raise RuntimeError(f"Symbol {normalized} not found in MT5")
-        tick = mt5.symbol_info_tick(normalized)
-        request = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": normalized,
-            "volume": float(volume),
-            "type": mt5.ORDER_TYPE_BUY,
-            "price": tick.ask,
-            "sl": sl,
-            "tp": tp,
-            "deviation": 10,
-            "magic": 123456,
-            "comment": comment,
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
-        }
-        return mt5.order_send(request)
-
-    def sell(self, symbol, volume, sl=None, tp=None, comment="AUTO SELL"):
-        if not self.connected:
-            raise RuntimeError("MT5 not connected")
-        normalized = self.normalize_symbol(symbol)
-        if self.get_symbol_info(normalized) is None:
-            raise RuntimeError(f"Symbol {normalized} not found in MT5")
-        tick = mt5.symbol_info_tick(normalized)
-        request = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": normalized,
-            "volume": float(volume),
-            "type": mt5.ORDER_TYPE_SELL,
-            "price": tick.bid,
-            "sl": sl,
-            "tp": tp,
-            "deviation": 10,
-            "magic": 123456,
-            "comment": comment,
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
-        }
-        return mt5.order_send(request)
+        return {"symbol": symbol, "ask": float(tick.ask), "bid": float(tick.bid),
+                "spread": float(tick.ask - tick.bid), "point": float(info.point),
+                "digits": int(info.digits), "info": info, "tick": tick}
 
     def positions(self):
         if not self.connected:
             return []
-        return mt5.positions_get()
+        return list(mt5.positions_get() or [])
 
-    def close_all_positions(self):
+    def bot_positions(self):
+        return [p for p in self.positions() if p.magic == MAGIC]
+
+    def risk_volume(self, symbol, side, entry, stop, equity=None):
+        """Size lots from estimated account-currency loss at SL using broker contract specs."""
+        info = mt5.symbol_info(symbol)
+        account = mt5.account_info()
+        if info is None or account is None:
+            raise ValueError("Cannot read symbol/account information.")
+        if info.trade_tick_size <= 0 or info.volume_step <= 0:
+            raise ValueError("Broker has invalid tick/volume specifications for this symbol.")
+        order_type = mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL
+        one_lot_loss = mt5.order_calc_profit(order_type, symbol, 1.0, float(entry), float(stop))
+        if one_lot_loss is None or not math.isfinite(one_lot_loss) or one_lot_loss >= 0:
+            raise ValueError("Cannot calculate stop-loss risk for this instrument; order blocked.")
+        risk_cash = float(equity if equity is not None else account.equity) * (RISK_PERCENT / 100.0)
+        raw_volume = risk_cash / abs(one_lot_loss)
+        # Round down so rounding cannot increase intended risk.
+        steps = math.floor((raw_volume + 1e-12) / info.volume_step)
+        volume = steps * info.volume_step
+        volume = round(volume, 8)
+        if volume < info.volume_min:
+            raise ValueError(
+                f"Risk-based volume ({volume}) is below broker minimum ({info.volume_min}); "
+                "trade blocked rather than exceeding the risk budget."
+            )
+        volume = min(volume, info.volume_max)
+        return volume
+
+    def send_order(self, symbol, side, volume, sl, tp, comment):
         if not self.connected:
-            return []
-        positions = mt5.positions_get()
-        closed = []
-        for pos in positions or []:
-            symbol = pos.symbol
-            type_order = pos.type
-            volume = pos.volume
-            tick = mt5.symbol_info_tick(symbol)
-            if type_order == mt5.ORDER_TYPE_BUY:
-                request = {
-                    "action": mt5.TRADE_ACTION_DEAL,
-                    "symbol": symbol,
-                    "volume": float(volume),
-                    "type": mt5.ORDER_TYPE_SELL,
-                    "price": tick.bid,
-                    "deviation": 10,
-                    "magic": 123456,
-                    "comment": "Close BUY",
-                    "type_time": mt5.ORDER_TIME_GTC,
-                    "type_filling": mt5.ORDER_FILLING_IOC,
-                }
-            else:
-                request = {
-                    "action": mt5.TRADE_ACTION_DEAL,
-                    "symbol": symbol,
-                    "volume": float(volume),
-                    "type": mt5.ORDER_TYPE_BUY,
-                    "price": tick.ask,
-                    "deviation": 10,
-                    "magic": 123456,
-                    "comment": "Close SELL",
-                    "type_time": mt5.ORDER_TIME_GTC,
-                    "type_filling": mt5.ORDER_FILLING_IOC,
-                }
+            raise RuntimeError("MT5 not connected")
+        market = self.market_price(symbol)
+        if market is None:
+            raise ValueError(f"Symbol {symbol} is unavailable or not selected in MT5.")
+        info, tick = market["info"], market["tick"]
+        if info.trade_mode == mt5.SYMBOL_TRADE_MODE_DISABLED:
+            raise ValueError(f"Trading is disabled for {symbol}.")
+        volume = float(volume)
+        step = float(info.volume_step)
+        if volume < info.volume_min or volume > info.volume_max or abs(volume / step - round(volume / step)) > 1e-6:
+            raise ValueError(f"Volume must match broker limits: min {info.volume_min}, max {info.volume_max}, step {step}.")
+        price = market["ask"] if side == "BUY" else market["bid"]
+        stop_distance = abs(price - float(sl))
+        min_stop = max(int(info.trade_stops_level), 0) * float(info.point)
+        if stop_distance < min_stop:
+            raise ValueError(f"Stop loss is inside broker's minimum stop distance ({min_stop:g}).")
+        if side == "BUY" and not (sl < price < tp):
+            raise ValueError("BUY requires SL < entry price < TP.")
+        if side == "SELL" and not (tp < price < sl):
+            raise ValueError("SELL requires TP < entry price < SL.")
+        request_base = {
+            "action": mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": volume,
+            "type": mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL,
+            "price": price, "sl": round(float(sl), info.digits), "tp": round(float(tp), info.digits),
+            "deviation": 20, "magic": MAGIC, "comment": comment[:31],
+            "type_time": mt5.ORDER_TIME_GTC,
+        }
+        # Broker execution modes vary. Try supported filling policies rather than assuming IOC.
+        modes = []
+        if info.filling_mode & mt5.SYMBOL_FILLING_FOK:
+            modes.append(mt5.ORDER_FILLING_FOK)
+        if info.filling_mode & mt5.SYMBOL_FILLING_IOC:
+            modes.append(mt5.ORDER_FILLING_IOC)
+        modes.append(mt5.ORDER_FILLING_RETURN)
+        last_result = None
+        for mode in dict.fromkeys(modes):
+            request = dict(request_base, type_filling=mode)
+            last_result = mt5.order_send(request)
+            if last_result is not None and last_result.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED, mt5.TRADE_RETCODE_DONE_PARTIAL):
+                return last_result
+            if last_result is None or getattr(last_result, "retcode", None) not in (
+                mt5.TRADE_RETCODE_INVALID_FILL, mt5.TRADE_RETCODE_INVALID,
+            ):
+                break
+        return last_result
+
+    def close_bot_positions(self):
+        results = []
+        for pos in self.bot_positions():
+            tick = mt5.symbol_info_tick(pos.symbol)
+            info = mt5.symbol_info(pos.symbol)
+            if tick is None or info is None:
+                results.append({"ticket": pos.ticket, "ok": False, "error": "No quote"})
+                continue
+            is_buy = pos.type == mt5.POSITION_TYPE_BUY
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL, "position": pos.ticket,
+                "symbol": pos.symbol, "volume": float(pos.volume),
+                "type": mt5.ORDER_TYPE_SELL if is_buy else mt5.ORDER_TYPE_BUY,
+                "price": float(tick.bid if is_buy else tick.ask), "deviation": 20,
+                "magic": MAGIC, "comment": "Bot close",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
             result = mt5.order_send(request)
-            closed.append({"ticket": pos.ticket, "symbol": symbol, "result": result})
-        return closed
+            results.append({"ticket": pos.ticket, "ok": result is not None and result.retcode in
+                            (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL),
+                            "result": result})
+        return results
 
 
-mt5_client = MT5Client(MT5_LOGIN, MT5_PASSWORD, MT5_SERVER)
+client = MT5Client(MT5_LOGIN, MT5_PASSWORD, MT5_SERVER)
 
 
-def validate_trade_dimensions(account_info, positions_count, volume, sl_points, tp_points):
-    if not account_info:
-        return False, "Account info unavailable."
-    if positions_count >= MAX_OPEN_TRADES:
-        return False, f"Max open trades reached: {MAX_OPEN_TRADES}."
-    if sl_points < MIN_STOP_LOSS_POINTS:
-        return False, f"Stop loss too small. Minimum is {MIN_STOP_LOSS_POINTS} points."
-    if tp_points <= sl_points:
-        return False, "Take profit must be bigger than stop loss."
-    if volume <= 0:
-        return False, "Volume must be greater than zero."
-
-    balance = account_info["balance"]
-    profit = account_info["profit"]
-    daily_limit = balance * (MAX_DAILY_DRAWDOWN_PERCENT / 100.0)
-    total_limit = balance * (MAX_TOTAL_DRAWDOWN_PERCENT / 100.0)
-    if profit <= -daily_limit:
-        return False, f"Daily drawdown limit reached: {MAX_DAILY_DRAWDOWN_PERCENT}%"
-    if profit <= -total_limit:
-        return False, f"Total drawdown limit reached: {MAX_TOTAL_DRAWDOWN_PERCENT}%"
+def guard(account, symbol):
+    if not account:
+        return False, "Account information unavailable."
+    if len(client.bot_positions()) >= MAX_OPEN_TRADES:
+        return False, f"Bot position limit reached ({MAX_OPEN_TRADES})."
+    if not symbol or mt5.symbol_info(symbol) is None:
+        return False, f"Symbol {symbol!r} not found. Use its exact broker symbol name."
     return True, "OK"
 
 
-def build_signal_message(signal_info: Dict[str, Any]) -> str:
-    if not signal_info:
-        return "No valid signal detected."
-    symbol = signal_info["symbol"]
-    side = signal_info["signal"]
-    price = signal_info["price"]
-    stop = signal_info["sl"]
-    take = signal_info["tp"]
-    rsi = signal_info["rsi"]
-    ema_short = signal_info["ema_short"]
-    ema_long = signal_info["ema_long"]
-    ema_trend = signal_info["ema_trend"]
+def build_signal_message(s):
     return (
-        f"📡 *AUTO SIGNAL*\n\n"
-        f"Symbol: {symbol}\n"
-        f"Direction: {side}\n"
-        f"Price: {price:.5f}\n"
-        f"SL: {stop:.5f}\n"
-        f"TP: {take:.5f}\n"
-        f"RSI(14): {rsi:.2f}\n"
-        f"EMA20: {ema_short:.5f}\n"
-        f"EMA50: {ema_long:.5f}\n"
-        f"EMA200: {ema_trend:.5f}\n\n"
-        f"Use the buttons below to confirm or reject."
+        f"*MT5 SIGNAL — {s['symbol']}*\n"
+        f"Direction: {s['signal']} | Timeframe: {s['timeframe']}\n"
+        f"Entry estimate: {s['price']}\nSL: {s['sl']}\nTP: {s['tp']}\n"
+        f"ATR: {s['atr']:.6g} | RSI: {s['rsi']:.2f}\n"
+        f"Risk target: {RISK_PERCENT:.2f}% equity (volume calculated at confirmation)\n"
+        "Broker symbol properties are used; test on demo before live trading."
     )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "🔥 *AUTO SIGNAL FTMO BOT*\n\n"
-        "• /connect\n"
-        "• /status\n"
-        "• /scan\n"
-        "• /manual BUY GOLD 0.02 60 120\n"
-        "• /manual SELL USDJPY 0.10 80 160\n"
-        "• /closeall\n\n"
-        "This bot generates automatic trade signals from EMA + RSI logic and allows manual confirmation before executing."
+    await update.effective_message.reply_text(
+        "MT5 Universal Instruments Bot\n/connect — connect MT5\n/status — account status\n"
+        "/scan — scan visible tradable Market Watch symbols\n"
+        "/manual BUY SYMBOL 0.01 1.234 1.240 — manual order with explicit SL/TP prices\n"
+        "/closeall — close bot-managed positions only"
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def connect_mt5(update, context):
     try:
-        mt5_client.connect()
-        await update.message.reply_text("✅ MT5 connected.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ MT5 connection failed: {e}")
+        client.connect()
+        await update.effective_message.reply_text("MT5 connected.")
+    except Exception as exc:
+        await update.effective_message.reply_text(f"Connection failed: {exc}")
 
 
 async def status(update, context):
-    if not mt5_client.connected:
-        await update.message.reply_text("❌ MT5 not connected. Use /connect")
-        return
-    info = mt5_client.account_info()
+    info = client.account_info()
     if not info:
-        await update.message.reply_text("❌ Could not read account info.")
+        await update.effective_message.reply_text("MT5 not connected. Use /connect.")
         return
-    positions = mt5_client.positions()
-    pos_text = "No active positions."
-    if positions:
-        pos_text = "\n".join(
-            [f"- {p.symbol} | {p.type} | Vol: {p.volume} | P/L: {p.profit}" for p in positions]
-        )
-    text = (
-        "📊 *ACCOUNT STATUS*\n\n"
-        f"Balance: ${info['balance']:.2f}\n"
-        f"Equity: ${info['equity']:.2f}\n"
-        f"Profit: ${info['profit']:.2f}\n"
-        f"Margin: ${info['margin']:.2f}\n"
-        f"Free Margin: ${info['free_margin']:.2f}\n\n"
-        f"Positions:\n{pos_text}"
+    positions = client.bot_positions()
+    lines = [f"{p.symbol} {'BUY' if p.type == mt5.POSITION_TYPE_BUY else 'SELL'} vol={p.volume} P/L={p.profit:.2f}" for p in positions]
+    await update.effective_message.reply_text(
+        f"Balance: {info['balance']:.2f} {info['currency']}\nEquity: {info['equity']:.2f}\n"
+        f"Floating P/L: {info['profit']:.2f}\nBot positions: {len(positions)}\n" +
+        ("\n".join(lines) if lines else "No bot-managed positions.")
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
 
 
-async def manual_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not mt5_client.connected:
-        await update.message.reply_text("❌ MT5 not connected. /connect first.")
+async def scan_signals(update, context):
+    if not client.connected:
+        await update.effective_message.reply_text("MT5 not connected. Use /connect.")
         return
-    if len(context.args) < 5:
-        await update.message.reply_text("Use: /manual BUY GOLD 0.02 60 120 \nor\n /manual SELL USDJPY 0.10 80 160")
+    symbols = supported_symbols()
+    if not symbols:
+        await update.effective_message.reply_text("No visible tradable symbols found. Enable instruments in MT5 Market Watch.")
         return
-    side = context.args[0].upper()
-    symbol = context.args[1].upper()
-    volume = float(context.args[2])
-    sl_points = int(context.args[3])
-    tp_points = int(context.args[4])
-    normalized = mt5_client.normalize_symbol(symbol)
-    market = mt5_client.market_price(normalized)
-    if not market:
-        await update.message.reply_text(f"❌ {normalized} is not available in MT5.")
-        return
-    info = mt5_client.account_info()
-    ok, msg = validate_trade_dimensions(info, len(mt5_client.positions() or []), volume, sl_points, tp_points)
-    if not ok:
-        await update.message.reply_text(f"❌ {msg}")
-        return
-    if side == "BUY":
-        sl_value = market["ask"] - (sl_points * 0.0001)
-        tp_value = market["ask"] + (tp_points * 0.0001)
-        result = mt5_client.buy(normalized, volume, sl=sl_value, tp=tp_value, comment="MANUAL BUY")
-    elif side == "SELL":
-        sl_value = market["bid"] + (sl_points * 0.0001)
-        tp_value = market["bid"] - (tp_points * 0.0001)
-        result = mt5_client.sell(normalized, volume, sl=sl_value, tp=tp_value, comment="MANUAL SELL")
-    else:
-        await update.message.reply_text("Use BUY or SELL")
-        return
-    if result is None or result.retcode not in (0, 10009, 10008):
-        await update.message.reply_text(f"❌ Order failed: {result.comment if result else 'Unknown error'}")
-        return
-    await update.message.reply_text(f"✅ Manual {side} order executed for {normalized}.")
+    sent = 0
+    for symbol in symbols:
+        try:
+            signal = generate_signal(symbol)
+            if not signal:
+                continue
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("Confirm", callback_data=f"confirm|{symbol}|{signal['signal']}|{signal['sl']}|{signal['tp']}"),
+                InlineKeyboardButton("Reject", callback_data=f"reject|{symbol}")
+            ]])
+            await update.effective_message.reply_text(build_signal_message(signal), parse_mode="Markdown", reply_markup=keyboard)
+            sent += 1
+        except Exception:
+            logging.exception("Signal generation failed for %s", symbol)
+    await update.effective_message.reply_text(f"Scan complete: {len(symbols)} symbols checked, {sent} signals found.")
 
 
-async def scan_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not mt5_client.connected:
-        await update.message.reply_text("❌ MT5 not connected. Use /connect")
-        return
-    results = []
-    for symbol in supported_symbols():
-        signal_info = generate_signal(symbol)
-        if signal_info and signal_info["signal"] in ("BUY", "SELL"):
-            results.append(signal_info)
-    if not results:
-        await update.message.reply_text("📡 No valid auto-signal found right now.")
-        return
-    for item in results[:3]:
-        message = build_signal_message(item)
-        keyboard = InlineKeyboardMarkup(
-            [[
-                InlineKeyboardButton("✅ Confirm", callback_data=f"confirm|{item['symbol']}|{item['signal']}|{item['volume']}|{item['sl_points']}|{item['tp_points']}"),
-                InlineKeyboardButton("❌ Reject", callback_data=f"reject|{item['symbol']}|{item['signal']}"),
-            ]]
-        )
-        pending_signals[update.effective_chat.id] = item
-        await update.message.reply_text(message, parse_mode="Markdown", reply_markup=keyboard)
-
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_callback(update, context):
     query = update.callback_query
     await query.answer()
-    data = query.data or ""
-    parts = data.split("|")
+    parts = (query.data or "").split("|")
     if not parts:
         return
-    action = parts[0]
-    if action == "reject":
-        await query.edit_message_text("❌ Signal rejected.")
+    if parts[0] == "reject":
+        await query.edit_message_text("Signal rejected.")
         return
-    if action == "confirm":
-        if len(parts) < 6:
-            await query.edit_message_text("❌ Invalid signal payload.")
-            return
-        symbol = parts[1]
-        side = parts[2]
-        volume = float(parts[3])
-        sl_points = int(parts[4])
-        tp_points = int(parts[5])
-        market = mt5_client.market_price(symbol)
-        if not market:
-            await query.edit_message_text(f"❌ {symbol} unavailable in MT5.")
-            return
-        info = mt5_client.account_info()
-        ok, msg = validate_trade_dimensions(info, len(mt5_client.positions() or []), volume, sl_points, tp_points)
+    if parts[0] != "confirm" or len(parts) != 5:
+        await query.edit_message_text("Invalid signal payload.")
+        return
+    if not client.connected:
+        await query.edit_message_text("MT5 not connected; signal not executed.")
+        return
+    _, symbol, side, sl_text, tp_text = parts
+    try:
+        sl, tp = float(sl_text), float(tp_text)
+        market = client.market_price(symbol)
+        account = client.account_info()
+        ok, reason = guard(account, symbol)
         if not ok:
-            await query.edit_message_text(f"❌ {msg}")
+            await query.edit_message_text(f"Trade blocked: {reason}")
             return
-        if side == "BUY":
-            sl_value = market["ask"] - (sl_points * 0.0001)
-            tp_value = market["ask"] + (tp_points * 0.0001)
-            result = mt5_client.buy(symbol, volume, sl=sl_value, tp=tp_value, comment="AUTO SIGNAL BUY")
-            success_text = f"✅ Auto BUY executed for {symbol}."
-        else:
-            sl_value = market["bid"] + (sl_points * 0.0001)
-            tp_value = market["bid"] - (tp_points * 0.0001)
-            result = mt5_client.sell(symbol, volume, sl=sl_value, tp=tp_value, comment="AUTO SIGNAL SELL")
-            success_text = f"✅ Auto SELL executed for {symbol}."
-        if result is None or result.retcode not in (0, 10009, 10008):
-            await query.edit_message_text(f"❌ Trade rejected by MT5: {result.comment if result else 'Unknown error'}")
+        if market is None:
+            await query.edit_message_text(f"Trade blocked: no quote for {symbol}.")
             return
-        await query.edit_message_text(success_text)
+        entry = market["ask"] if side == "BUY" else market["bid"]
+        info = market["info"]
+        spread = market["spread"]
+        if spread > MAX_SPREAD_ATR_RATIO * max(abs(entry - sl), info.point):
+            await query.edit_message_text("Trade blocked: spread is too large relative to stop distance.")
+            return
+        volume = client.risk_volume(symbol, side, entry, sl, account["equity"])
+        result = client.send_order(symbol, side, volume, sl, tp, "Universal signal")
+        if result is None or result.retcode not in (
+            mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED, mt5.TRADE_RETCODE_DONE_PARTIAL
+        ):
+            await query.edit_message_text(f"MT5 rejected order: {getattr(result, 'comment', 'no result')}")
+            return
+        await query.edit_message_text(
+            f"Order sent: {side} {symbol}, volume {volume}. Estimated risk target {RISK_PERCENT:.2f}% equity. "
+            "Actual loss may differ due to slippage, gaps, fees and execution."
+        )
+    except Exception as exc:
+        logging.exception("Trade confirmation failed")
+        await query.edit_message_text(f"Trade blocked: {exc}")
+
+
+async def manual_trade(update, context):
+    if not client.connected:
+        await update.effective_message.reply_text("MT5 not connected. Use /connect.")
+        return
+    if len(context.args) != 5:
+        await update.effective_message.reply_text("Usage: /manual BUY SYMBOL VOLUME SL_PRICE TP_PRICE")
+        return
+    try:
+        side, symbol = context.args[0].upper(), context.args[1]
+        if side not in ("BUY", "SELL"):
+            raise ValueError("Side must be BUY or SELL.")
+        volume, sl, tp = float(context.args[2]), float(context.args[3]), float(context.args[4])
+        market = client.market_price(symbol)
+        account = client.account_info()
+        ok, reason = guard(account, symbol)
+        if not ok:
+            raise ValueError(reason)
+        if market is None:
+            raise ValueError("No quote for this symbol.")
+        entry = market["ask"] if side == "BUY" else market["bid"]
+        one_lot_loss = mt5.order_calc_profit(mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL,
+                                             symbol, volume, entry, sl)
+        if one_lot_loss is None or one_lot_loss >= 0:
+            raise ValueError("SL is on the wrong side or broker cannot calculate risk.")
+        max_risk = account["equity"] * RISK_PERCENT / 100.0
+        if abs(one_lot_loss) > max_risk:
+            raise ValueError(f"Manual order exceeds {RISK_PERCENT:.2f}% risk cap ({abs(one_lot_loss):.2f} > {max_risk:.2f} {account['currency']}).")
+        result = client.send_order(symbol, side, volume, sl, tp, "Manual order")
+        if result is None or result.retcode not in (
+            mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED, mt5.TRADE_RETCODE_DONE_PARTIAL
+        ):
+            raise ValueError(f"MT5 rejected order: {getattr(result, 'comment', 'no result')}")
+        await update.effective_message.reply_text(f"Order sent: {side} {symbol}, volume {volume}.")
+    except Exception as exc:
+        await update.effective_message.reply_text(f"Trade blocked: {exc}")
 
 
 async def close_all(update, context):
-    if not mt5_client.connected:
-        await update.message.reply_text("❌ MT5 not connected.")
+    if not client.connected:
+        await update.effective_message.reply_text("MT5 not connected.")
         return
-    mt5_client.close_all_positions()
-    await update.message.reply_text("✅ All positions closed.")
+    results = client.close_bot_positions()
+    ok = sum(1 for item in results if item.get("ok"))
+    await update.effective_message.reply_text(
+        f"Close requests successful: {ok}/{len(results)}. Only positions with bot magic number {MAGIC} were targeted; check MT5 for final status."
+    )
 
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN missing. Add it in .env")
+        raise RuntimeError("TELEGRAM_BOT_TOKEN missing. Add it to .env")
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("connect", connect_mt5))
@@ -412,7 +347,7 @@ def main():
     app.add_handler(CommandHandler("manual", manual_trade))
     app.add_handler(CommandHandler("closeall", close_all))
     app.add_handler(CallbackQueryHandler(handle_callback))
-    print("Auto signal bot started...")
+    logging.info("Universal MT5 signal bot started")
     app.run_polling()
 
 
