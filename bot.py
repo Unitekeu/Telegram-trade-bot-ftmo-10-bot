@@ -8,7 +8,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 
 from config import (
     MAX_OPEN_TRADES, MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, RISK_PERCENT,
-    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_IDS,
 )
 from strategy import generate_signal, supported_symbols
 
@@ -161,6 +161,18 @@ class MT5Client:
 
 client = MT5Client(MT5_LOGIN, MT5_PASSWORD, MT5_SERVER)
 
+def authorized(update):
+    user = update.effective_user
+    return bool(user and user.id in TELEGRAM_ALLOWED_USER_IDS)
+
+async def deny_unauthorized(update):
+    if not authorized(update):
+        message = update.effective_message
+        if message:
+            await message.reply_text("Access denied. Configure your numeric Telegram ID in TELEGRAM_ALLOWED_USER_IDS.")
+        return True
+    return False
+
 
 def guard(account, symbol):
     if not account:
@@ -193,6 +205,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def connect_mt5(update, context):
+    if await deny_unauthorized(update): return
     try:
         client.connect()
         await update.effective_message.reply_text("MT5 connected.")
@@ -201,6 +214,7 @@ async def connect_mt5(update, context):
 
 
 async def status(update, context):
+    if await deny_unauthorized(update): return
     info = client.account_info()
     if not info:
         await update.effective_message.reply_text("MT5 not connected. Use /connect.")
@@ -215,6 +229,7 @@ async def status(update, context):
 
 
 async def scan_signals(update, context):
+    if await deny_unauthorized(update): return
     if not client.connected:
         await update.effective_message.reply_text("MT5 not connected. Use /connect.")
         return
@@ -240,6 +255,9 @@ async def scan_signals(update, context):
 
 
 async def handle_callback(update, context):
+    if await deny_unauthorized(update):
+        await update.callback_query.answer()
+        return
     query = update.callback_query
     await query.answer()
     parts = (query.data or "").split("|")
@@ -289,6 +307,7 @@ async def handle_callback(update, context):
 
 
 async def manual_trade(update, context):
+    if await deny_unauthorized(update): return
     if not client.connected:
         await update.effective_message.reply_text("MT5 not connected. Use /connect.")
         return
@@ -326,6 +345,7 @@ async def manual_trade(update, context):
 
 
 async def close_all(update, context):
+    if await deny_unauthorized(update): return
     if not client.connected:
         await update.effective_message.reply_text("MT5 not connected.")
         return
